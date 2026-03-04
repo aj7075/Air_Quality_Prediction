@@ -1,0 +1,16 @@
+model_name,feature,importance,phase
+Linear Regression (Baseline),PM2.5,0.0900102011333496,before
+Linear Regression (Baseline),NO2,0.03408467689793688,before
+Linear Regression (Baseline),CO,0.7977787191417041,before
+Linear Regression (Baseline),SO2,0.05686804597811132,before
+Linear Regression (Baseline),O3,0.02125835677643302,before
+Random Forest,PM2.5,0.530082527857826,after
+Random Forest,NO2,0.02828153451168138,after
+Random Forest,CO,0.39919874448785214,after
+Random Forest,SO2,0.021661048975762206,after
+Random Forest,O3,0.020776144166878435,after
+XGBoost (Final),PM2.5,0.418302446603775,after
+XGBoost (Final),NO2,0.046114884316921234,after
+XGBoost (Final),CO,0.4681968688964844,after
+XGBoost (Final),SO2,0.04239913821220398,after
+XGBoost (Final),O3,0.02498675137758255,after

@@ -1,0 +1,4 @@
+area,before,after,impact_type,impact_level
+Modeling,Simple baseline Linear Regression with limited tuning.,Ensemble models (Random Forest / XGBoost) with better generalization.,Accuracy,High
+Data Handling,Basic use of pollutant features without rich exploration.,Cleaned dataset with selected key pollutants and better preprocessing.,Reliability,Medium
+User Experience,Basic AQI prediction interface only.,"Streamlit app with geolocation, maps, health and psychological recommendations.",User Experience,High

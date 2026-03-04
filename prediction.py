@@ -69,13 +69,122 @@ def get_location():
     components.html(loc_html, height=0)
 
 def load_model():
+    """
+    Load trained model artifacts from disk.
+
+    The pickle may contain:
+    - 'model': baseline RandomForestRegressor.
+    - 'stage1_classifier': RandomForestClassifier (Normal vs High-Risk).
+    - 'stage2_normal_regressor': XGBoost regressor for Normal regime.
+    - 'stage2_high_risk_regressor': XGBoost regressor for High-Risk regime.
+    - 'feature_columns': list of feature names used for the hybrid models.
+    - 'aqi_threshold': numeric threshold between Normal and High-Risk.
+    """
     with open('./new_model.pkl', 'rb') as file:
         data = pickle.load(file)
     return data
 
 
-data = load_model()
-regressor = data["model"]
+model_artifacts = load_model()
+baseline_regressor = model_artifacts.get("model", None)
+stage1_classifier = model_artifacts.get("stage1_classifier", None)
+stage2_normal_regressor = model_artifacts.get("stage2_normal_regressor", None)
+stage2_high_risk_regressor = model_artifacts.get("stage2_high_risk_regressor", None)
+hybrid_feature_columns = model_artifacts.get("feature_columns", None)
+aqi_threshold = model_artifacts.get("aqi_threshold", 200.0)
+
+
+def build_hybrid_feature_row(pm25, no2, co, so2, o3, city_name=None):
+    """
+    Build a single-row feature vector compatible with the hybrid temporal-spatial models.
+
+    Since we do not have full 24h history for the interactive UI, we approximate:
+    - Lag features by using the current value (steady-state assumption).
+    - 24h rolling averages by using the current value.
+    - Time features from the current system time.
+    - City one-hot features from the selected city name (if it exists in training).
+    """
+    if not hybrid_feature_columns:
+        # Fallback to simple 5-feature vector if feature list is unavailable
+        return pd.DataFrame(
+            [[pm25, no2, co, so2, o3]],
+            columns=['PM2.5', 'NO2', 'CO', 'SO2', 'O3']
+        )
+
+    # Base pollutant mapping
+    base_values = {
+        'PM2.5': pm25,
+        'NO2': no2,
+        'CO': co,
+        'SO2': so2,
+        'O3': o3,
+    }
+
+    now = datetime.now()
+    hour = now.hour
+    month = now.month
+
+    row = []
+    for col in hybrid_feature_columns:
+        if col in base_values:
+            row.append(base_values[col])
+        elif col in ('PM2.5_lag1', 'PM2.5_lag3', 'PM2.5_lag6'):
+            row.append(pm25)
+        elif col in ('NO2_lag1', 'NO2_lag3', 'NO2_lag6'):
+            row.append(no2)
+        elif col.endswith('_roll24'):
+            # Use current value as a proxy for the 24h rolling mean
+            base_name = col.replace('_roll24', '')
+            row.append(base_values.get(base_name, 0.0))
+        elif col == 'hour':
+            row.append(hour)
+        elif col == 'month':
+            row.append(month)
+        elif col.startswith('City_'):
+            # One-hot encode selected city if provided; otherwise leave all cities as 0
+            if city_name is not None:
+                city_col_name = f"City_{city_name}"
+                row.append(1.0 if col == city_col_name else 0.0)
+            else:
+                row.append(0.0)
+        else:
+            # Any other engineered feature not explicitly handled
+            row.append(0.0)
+
+    return pd.DataFrame([row], columns=hybrid_feature_columns)
+
+
+def hybrid_predict(pm25, no2, co, so2, o3, city_name=None):
+    """
+    Run the hybrid cascade:
+    - Stage 1 classifier decides Normal vs High-Risk regime.
+    - Stage 2 appropriate regressor predicts AQI.
+    """
+    if (
+        stage1_classifier is None
+        or stage2_normal_regressor is None
+        or hybrid_feature_columns is None
+    ):
+        return None, "Hybrid temporal-spatial model is not available. Falling back to baseline."
+
+    X_hybrid = build_hybrid_feature_row(pm25, no2, co, so2, o3, city_name)
+
+    # Stage 1: classify risk regime
+    regime = stage1_classifier.predict(X_hybrid)[0]
+
+    # Stage 2: choose appropriate regressor
+    if regime == 0:
+        aqi_pred = stage2_normal_regressor.predict(X_hybrid)[0]
+        regime_label = "Normal regime (AQI < {:.0f})".format(aqi_threshold)
+    else:
+        if stage2_high_risk_regressor is not None:
+            aqi_pred = stage2_high_risk_regressor.predict(X_hybrid)[0]
+            regime_label = "High-Risk regime (AQI ≥ {:.0f})".format(aqi_threshold)
+        else:
+            aqi_pred = stage2_normal_regressor.predict(X_hybrid)[0]
+            regime_label = "High-Risk regime (using Normal model fallback)"
+
+    return float(aqi_pred), regime_label
 
 
 def get_location_from_ip():
@@ -577,10 +686,17 @@ def show_geo_prediction_page():
 
 
 def show_predict_page():
-    st.title("AQI prediction")
-    st.write("""Input info. to predict AQI""")
-    
-    # Using consistent uppercase feature names
+    st.title("AQI Prediction")
+    st.write("""Input pollutant levels to predict AQI using either the baseline Random Forest model or the new hybrid temporal–spatial cascade (research).""")
+
+    # Model selection: baseline vs hybrid cascade
+    model_choice = st.radio(
+        "Select prediction model",
+        ["Baseline Random Forest", "Hybrid Temporal–Spatial Cascade (Research)"],
+        help="Use the baseline model for best overall error, or the hybrid cascade to showcase the research system."
+    )
+
+    # Pollutant inputs
     PM2_5 = st.number_input("PM2.5 (Usually ranges from 0.1 to 120)", min_value=0.0, max_value=950.0, step=0.01, format="%.2f")
     NO2 = st.number_input("NO2 (Usually ranges from 0.01 to 60)", min_value=0.0, max_value=362.0, step=0.01, format="%.2f")
     CO = st.number_input("CO (Usually ranges from 0 to 3)", min_value=0.0, max_value=1756.0, step=0.01, format="%.2f")
@@ -589,10 +705,6 @@ def show_predict_page():
 
     ok = st.button("Calculate AQI")
     if ok:
-        # Create DataFrame with uppercase feature names
-        X = pd.DataFrame([[PM2_5, NO2, CO, SO2, O3]], columns=['PM2.5', 'NO2', 'CO', 'SO2', 'O3'])
-        AQI = regressor.predict(X)[0]
-        
         # Convert AQI to category with emoji
         def get_aqi_category(aqi):
             if aqi <= 50:
@@ -605,10 +717,38 @@ def show_predict_page():
                 return ("Poor", "🔴")
             else:
                 return ("Severe", "⚫")
-        
+
+        if model_choice == "Hybrid Temporal–Spatial Cascade (Research)":
+            aqi_pred, regime_label = hybrid_predict(PM2_5, NO2, CO, SO2, O3)
+            if aqi_pred is None:
+                st.warning(regime_label)
+                # Fallback to baseline if hybrid is unavailable
+                if baseline_regressor is not None:
+                    X = pd.DataFrame(
+                        [[PM2_5, NO2, CO, SO2, O3]],
+                        columns=['PM2.5', 'NO2', 'CO', 'SO2', 'O3']
+                    )
+                    aqi_pred = baseline_regressor.predict(X)[0]
+                    regime_label = "Baseline Random Forest (fallback)"
+                else:
+                    st.error("No trained model is available for prediction.")
+                    return
+            AQI = aqi_pred
+            st.markdown(f"**Hybrid regime decision:** {regime_label}")
+        else:
+            if baseline_regressor is None:
+                st.error("Baseline model is not available.")
+                return
+            X = pd.DataFrame(
+                [[PM2_5, NO2, CO, SO2, O3]],
+                columns=['PM2.5', 'NO2', 'CO', 'SO2', 'O3']
+            )
+            AQI = baseline_regressor.predict(X)[0]
+
         category, emoji = get_aqi_category(AQI)
+        st.subheader(f"Predicted AQI: {AQI:.1f}")
         st.subheader(f"Air Quality Category: {category} {emoji}")
-        
+
         # Add health recommendations based on AQI
         st.subheader("Health Recommendations")
         if AQI <= 50:

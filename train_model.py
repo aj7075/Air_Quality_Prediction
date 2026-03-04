@@ -144,7 +144,7 @@ def train_hybrid_models(
         X,
         y_reg,
         y_cls,
-        test_size=0.2,
+        test_size=0.1,  # 10% test, 90% train
         random_state=42,
         stratify=y_cls,
     )
@@ -244,7 +244,8 @@ def train_hybrid_models(
             X_test[high_test_mask]
         )
 
-    rmse = mean_squared_error(y_reg_test, y_pred_cascade, squared=False)
+    mse = mean_squared_error(y_reg_test, y_pred_cascade)
+    rmse = np.sqrt(mse)
     r2 = r2_score(y_reg_test, y_pred_cascade)
     print(f"Hybrid cascade RMSE on test: {rmse:.3f}")
     print(f"Hybrid cascade R^2 on test: {r2:.4f}")

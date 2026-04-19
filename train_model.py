@@ -13,7 +13,8 @@ import matplotlib.pyplot as plt
 
 
 DATA_PATH = "Data/city_hour.csv"
-AQI_THRESHOLD = 200.0  # boundary between Normal and High-Risk
+AQI_THRESHOLD = 200.0  # boundary between Normal and elevated AQI
+AQI_SEVERE_THRESHOLD = 300.0  # boundary between elevated and Severe
 SHAP_OUTPUT_DIR = "bi_exports"
 
 
@@ -86,8 +87,17 @@ def load_and_engineer_features() -> pd.DataFrame:
     city_dummies = pd.get_dummies(df["City"], prefix="City", drop_first=True)
     df = pd.concat([df, city_dummies], axis=1)
 
-    # Binary risk bucket for Stage 1 classifier
-    df["risk_bucket"] = np.where(df["AQI"] < AQI_THRESHOLD, 0, 1)
+    # Multi-class risk bucket for Stage 1 classifier
+    # 0: Normal (<200), 1: Moderate-High (200-300), 2: Severe (>300)
+    df["risk_bucket"] = np.select(
+        [
+            df["AQI"] < AQI_THRESHOLD,
+            (df["AQI"] >= AQI_THRESHOLD) & (df["AQI"] <= AQI_SEVERE_THRESHOLD),
+            df["AQI"] > AQI_SEVERE_THRESHOLD,
+        ],
+        [0, 1, 2],
+        default=0,
+    ).astype(int)
 
     print(f"After feature engineering, data shape: {df.shape}")
     return df
@@ -135,9 +145,12 @@ def train_hybrid_models(
     """
     Train the hybrid cascade system:
 
-    - Stage 1: RandomForestClassifier for Normal vs High-Risk.
-    - Stage 2a: XGBoost regressor on Normal regime.
-    - Stage 2b: XGBoost regressor on High-Risk regime with heavy sample weighting.
+    - Stage 1: RandomForestClassifier for multi-class regime gating:
+        * 0: Normal (AQI < 200)
+        * 1: Moderate-High (200 <= AQI <= 300)
+        * 2: Severe (AQI > 300)
+    - Stage 2: three specialized XGBoost regressors (one per regime).
+      Severe regressor uses AQI-dependent sample weighting to emphasize extreme days.
     - Baseline: RandomForestRegressor on full data (for backward compatibility).
     """
     X_train, X_test, y_reg_train, y_reg_test, y_cls_train, y_cls_test = train_test_split(
@@ -151,7 +164,7 @@ def train_hybrid_models(
 
     print("Train shape:", X_train.shape, "Test shape:", X_test.shape)
 
-    # Stage 1: classifier
+    # Stage 1: multi-class classifier
     stage1_clf = RandomForestClassifier(
         n_estimators=300,
         max_depth=None,
@@ -164,19 +177,22 @@ def train_hybrid_models(
     print("Classification report (Stage 1) on test data:")
     print(classification_report(y_cls_test, stage1_clf.predict(X_test)))
 
-    # Split training data into Normal and High-Risk regimes for Stage 2
+    # Split training data into three regimes for Stage 2
     normal_mask = y_reg_train < AQI_THRESHOLD
-    high_mask = ~normal_mask
+    mid_mask = (y_reg_train >= AQI_THRESHOLD) & (y_reg_train <= AQI_SEVERE_THRESHOLD)
+    severe_mask = y_reg_train > AQI_SEVERE_THRESHOLD
 
     X_train_normal = X_train[normal_mask]
     y_train_normal = y_reg_train[normal_mask]
-
-    X_train_high = X_train[high_mask]
-    y_train_high = y_reg_train[high_mask]
+    X_train_mid = X_train[mid_mask]
+    y_train_mid = y_reg_train[mid_mask]
+    X_train_severe = X_train[severe_mask]
+    y_train_severe = y_reg_train[severe_mask]
 
     print(
-        f"Normal regime samples: {X_train_normal.shape[0]}, "
-        f"High-Risk regime samples: {X_train_high.shape[0]}"
+        f"Normal samples: {X_train_normal.shape[0]}, "
+        f"Mid (200-300) samples: {X_train_mid.shape[0]}, "
+        f"Severe (>300) samples: {X_train_severe.shape[0]}"
     )
 
     # Stage 2a: Normal regime regressor
@@ -193,16 +209,34 @@ def train_hybrid_models(
     stage2_normal.fit(X_train_normal, y_train_normal)
     print("Stage 2 (Normal) XGBoost regressor trained.")
 
-    # Stage 2b: High-Risk regime regressor with heavy sample weighting
-    if X_train_high.shape[0] > 0:
-        y_high_centered = np.maximum(y_train_high - AQI_THRESHOLD, 0.0)
-        if y_high_centered.max() > 0:
-            weights_high = 1.0 + 4.0 * (y_high_centered / y_high_centered.max())
-        else:
-            weights_high = np.ones_like(y_high_centered)
-
-        stage2_high = XGBRegressor(
+    # Stage 2b: Mid regime regressor (200-300)
+    if X_train_mid.shape[0] > 0:
+        stage2_mid = XGBRegressor(
             n_estimators=600,
+            learning_rate=0.04,
+            max_depth=6,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            objective="reg:squarederror",
+            n_jobs=-1,
+            random_state=42,
+        )
+        stage2_mid.fit(X_train_mid, y_train_mid)
+        print("Stage 2 (Mid 200-300) XGBoost regressor trained.")
+    else:
+        stage2_mid = None
+        print("Warning: No Mid (200-300) samples found for Stage 2 mid regressor.")
+
+    # Stage 2c: Severe regime regressor with heavy sample weighting
+    if X_train_severe.shape[0] > 0:
+        y_sev_centered = np.maximum(y_train_severe - AQI_SEVERE_THRESHOLD, 0.0)
+        if y_sev_centered.max() > 0:
+            weights_sev = 1.0 + 4.0 * (y_sev_centered / y_sev_centered.max())
+        else:
+            weights_sev = np.ones_like(y_sev_centered)
+
+        stage2_severe = XGBRegressor(
+            n_estimators=700,
             learning_rate=0.03,
             max_depth=7,
             subsample=0.9,
@@ -211,11 +245,11 @@ def train_hybrid_models(
             n_jobs=-1,
             random_state=42,
         )
-        stage2_high.fit(X_train_high, y_train_high, sample_weight=weights_high)
-        print("Stage 2 (High-Risk) XGBoost regressor trained with sample weighting.")
+        stage2_severe.fit(X_train_severe, y_train_severe, sample_weight=weights_sev)
+        print("Stage 2 (Severe >300) XGBoost regressor trained with sample weighting.")
     else:
-        stage2_high = None
-        print("Warning: No High-Risk samples found for Stage 2 high-risk regressor.")
+        stage2_severe = None
+        print("Warning: No Severe (>300) samples found for Stage 2 severe regressor.")
 
     # Baseline RandomForestRegressor on full data (kept for backward compatibility)
     baseline_rf = RandomForestRegressor(
@@ -227,22 +261,26 @@ def train_hybrid_models(
     # Evaluate cascade on test set
     stage1_preds = stage1_clf.predict(X_test)
     normal_test_mask = stage1_preds == 0
-    high_test_mask = stage1_preds == 1
+    mid_test_mask = stage1_preds == 1
+    severe_test_mask = stage1_preds == 2
 
     y_pred_cascade = np.zeros_like(y_reg_test.values, dtype=float)
     if normal_test_mask.any():
-        y_pred_cascade[normal_test_mask] = stage2_normal.predict(
-            X_test[normal_test_mask]
-        )
-    if high_test_mask.any() and stage2_high is not None:
-        y_pred_cascade[high_test_mask] = stage2_high.predict(
-            X_test[high_test_mask]
-        )
-    elif high_test_mask.any():
-        # Fallback to normal model if no dedicated high-risk model
-        y_pred_cascade[high_test_mask] = stage2_normal.predict(
-            X_test[high_test_mask]
-        )
+        y_pred_cascade[normal_test_mask] = stage2_normal.predict(X_test[normal_test_mask])
+
+    if mid_test_mask.any():
+        if stage2_mid is not None:
+            y_pred_cascade[mid_test_mask] = stage2_mid.predict(X_test[mid_test_mask])
+        else:
+            y_pred_cascade[mid_test_mask] = stage2_normal.predict(X_test[mid_test_mask])
+
+    if severe_test_mask.any():
+        if stage2_severe is not None:
+            y_pred_cascade[severe_test_mask] = stage2_severe.predict(X_test[severe_test_mask])
+        else:
+            # fallback: use mid if available else normal
+            fallback = stage2_mid if stage2_mid is not None else stage2_normal
+            y_pred_cascade[severe_test_mask] = fallback.predict(X_test[severe_test_mask])
 
     mse = mean_squared_error(y_reg_test, y_pred_cascade)
     rmse = np.sqrt(mse)
@@ -254,9 +292,11 @@ def train_hybrid_models(
         "model": baseline_rf,  # for existing prediction pipeline
         "stage1_classifier": stage1_clf,
         "stage2_normal_regressor": stage2_normal,
-        "stage2_high_risk_regressor": stage2_high,
+        "stage2_mid_regressor": stage2_mid,
+        "stage2_severe_regressor": stage2_severe,
         "feature_columns": feature_cols,
         "aqi_threshold": AQI_THRESHOLD,
+        "aqi_severe_threshold": AQI_SEVERE_THRESHOLD,
     }
 
 
@@ -296,25 +336,21 @@ def main():
         artifacts = train_hybrid_models(X, y_reg, y_cls, feature_cols)
 
         # Generate SHAP plots focused on chemical drivers of AQI
-        # Use a stratified sample from Normal and High-Risk regimes
+        # Use samples from Normal and Severe regimes (more stable for discussion)
         normal_mask = y_reg < AQI_THRESHOLD
-        high_mask = ~normal_mask
+        severe_mask = y_reg > AQI_SEVERE_THRESHOLD
 
         X_normal = X[normal_mask]
-        X_high = X[high_mask]
+        X_severe = X[severe_mask]
 
         # Subsample for efficiency
-        X_normal_sample = X_normal.sample(
-            n=min(2000, len(X_normal)), random_state=42
+        X_normal_sample = X_normal.sample(n=min(2000, len(X_normal)), random_state=42)
+        X_severe_sample = (
+            X_severe.sample(n=min(2000, len(X_severe)), random_state=42)
+            if len(X_severe) > 0
+            else None
         )
-        if len(X_high) > 0:
-            X_high_sample = X_high.sample(
-                n=min(2000, len(X_high)), random_state=42
-            )
-        else:
-            X_high_sample = None
 
-        shap.models = {}
         if isinstance(artifacts["stage2_normal_regressor"], XGBRegressor):
             generate_shap_summary(
                 artifacts["stage2_normal_regressor"],
@@ -322,14 +358,14 @@ def main():
                 label="normal_regime",
             )
         if (
-            artifacts["stage2_high_risk_regressor"] is not None
-            and X_high_sample is not None
-            and isinstance(artifacts["stage2_high_risk_regressor"], XGBRegressor)
+            artifacts.get("stage2_severe_regressor") is not None
+            and X_severe_sample is not None
+            and isinstance(artifacts["stage2_severe_regressor"], XGBRegressor)
         ):
             generate_shap_summary(
-                artifacts["stage2_high_risk_regressor"],
-                X_high_sample,
-                label="high_risk_regime",
+                artifacts["stage2_severe_regressor"],
+                X_severe_sample,
+                label="severe_regime",
             )
 
         # Persist artifacts, including baseline model for compatibility

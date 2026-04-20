@@ -89,9 +89,56 @@ model_artifacts = load_model()
 baseline_regressor = model_artifacts.get("model", None)
 stage1_classifier = model_artifacts.get("stage1_classifier", None)
 stage2_normal_regressor = model_artifacts.get("stage2_normal_regressor", None)
-stage2_high_risk_regressor = model_artifacts.get("stage2_high_risk_regressor", None)
+stage2_mid_regressor = model_artifacts.get("stage2_mid_regressor", None)
+stage2_severe_regressor = model_artifacts.get("stage2_severe_regressor", None)
 hybrid_feature_columns = model_artifacts.get("feature_columns", None)
 aqi_threshold = model_artifacts.get("aqi_threshold", 200.0)
+aqi_severe_threshold = model_artifacts.get("aqi_severe_threshold", 300.0)
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_engineered_city_hour_for_demo():
+    """
+    Load the engineered `city_hour.csv` dataset using the same feature engineering
+    as the research training pipeline.
+
+    Returns a dataframe that includes:
+    - City, Datetime, AQI (ground truth)
+    - Engineered feature columns (matching `feature_columns` stored in new_model.pkl)
+    """
+    try:
+        from train_model import load_and_engineer_features
+    except Exception as e:
+        raise RuntimeError(f"Could not import training feature engineering: {e}")
+
+    df = load_and_engineer_features()
+    return df
+
+
+def hybrid_predict_from_features(X_features: pd.DataFrame):
+    """
+    Hybrid prediction using a fully prepared feature vector (best for verification/demo).
+    """
+    if stage1_classifier is None or stage2_normal_regressor is None:
+        return None, "Hybrid models missing."
+    if hybrid_feature_columns is None:
+        return None, "Hybrid feature columns missing."
+
+    Xh = X_features[hybrid_feature_columns]
+    regime = int(stage1_classifier.predict(Xh)[0])
+
+    if regime == 0:
+        pred = float(stage2_normal_regressor.predict(Xh)[0])
+        label = f"Normal regime (AQI < {aqi_threshold:.0f})"
+    elif regime == 1:
+        reg = stage2_mid_regressor or stage2_normal_regressor
+        pred = float(reg.predict(Xh)[0])
+        label = f"Moderate-High regime ({aqi_threshold:.0f} <= AQI <= {aqi_severe_threshold:.0f})"
+    else:
+        reg = stage2_severe_regressor or stage2_mid_regressor or stage2_normal_regressor
+        pred = float(reg.predict(Xh)[0])
+        label = f"Severe regime (AQI > {aqi_severe_threshold:.0f})"
+
+    return pred, label
 
 
 def build_hybrid_feature_row(pm25, no2, co, so2, o3, city_name=None):
@@ -157,7 +204,7 @@ def build_hybrid_feature_row(pm25, no2, co, so2, o3, city_name=None):
 def hybrid_predict(pm25, no2, co, so2, o3, city_name=None):
     """
     Run the hybrid cascade:
-    - Stage 1 classifier decides Normal vs High-Risk regime.
+    - Stage 1 classifier decides Normal vs Mid vs Severe regime.
     - Stage 2 appropriate regressor predicts AQI.
     """
     if (
@@ -176,13 +223,21 @@ def hybrid_predict(pm25, no2, co, so2, o3, city_name=None):
     if regime == 0:
         aqi_pred = stage2_normal_regressor.predict(X_hybrid)[0]
         regime_label = "Normal regime (AQI < {:.0f})".format(aqi_threshold)
-    else:
-        if stage2_high_risk_regressor is not None:
-            aqi_pred = stage2_high_risk_regressor.predict(X_hybrid)[0]
-            regime_label = "High-Risk regime (AQI ≥ {:.0f})".format(aqi_threshold)
+    elif regime == 1:
+        if stage2_mid_regressor is not None:
+            aqi_pred = stage2_mid_regressor.predict(X_hybrid)[0]
+            regime_label = "Mid regime ({:.0f} <= AQI <= {:.0f})".format(aqi_threshold, aqi_severe_threshold)
         else:
             aqi_pred = stage2_normal_regressor.predict(X_hybrid)[0]
-            regime_label = "High-Risk regime (using Normal model fallback)"
+            regime_label = "Mid regime (using Normal model fallback)"
+    else:
+        if stage2_severe_regressor is not None:
+            aqi_pred = stage2_severe_regressor.predict(X_hybrid)[0]
+            regime_label = "Severe regime (AQI > {:.0f})".format(aqi_severe_threshold)
+        else:
+            fallback = stage2_mid_regressor if stage2_mid_regressor is not None else stage2_normal_regressor
+            aqi_pred = fallback.predict(X_hybrid)[0]
+            regime_label = "Severe regime (using fallback regressor)"
 
     return float(aqi_pred), regime_label
 
@@ -696,6 +751,61 @@ def show_predict_page():
         help="Use the baseline model for best overall error, or the hybrid cascade to showcase the research system."
     )
 
+    # Dataset-backed verification/demo (recommended for research)
+    with st.expander("Dataset-backed Hybrid Demo (recommended for verification)", expanded=False):
+        st.write(
+            "This mode loads a real City+Datetime row from `Data/city_hour.csv`, "
+            "uses the true engineered temporal–spatial features, and compares "
+            "**Predicted AQI vs True AQI**. This is the correct way to verify the research model."
+        )
+
+        try:
+            df_demo = load_engineered_city_hour_for_demo()
+            if hybrid_feature_columns is None:
+                st.error("Hybrid feature columns not found in `new_model.pkl`. Retrain the model first.")
+            else:
+                cities = sorted(df_demo["City"].dropna().unique().tolist())
+                city = st.selectbox("City", options=cities, index=cities.index("Delhi") if "Delhi" in cities else 0)
+
+                city_df = df_demo[df_demo["City"] == city].sort_values("Datetime")
+                n = min(5000, len(city_df))
+                city_df_tail = city_df.tail(n).reset_index(drop=True)
+
+                # Choose a row by index (avoids huge datetime select lists)
+                idx = st.slider("Select sample index (within recent rows)", 0, n - 1, n - 1)
+                row = city_df_tail.iloc[int(idx)]
+
+                # Show raw pollutants (what a user would recognize)
+                st.markdown("**Sample pollutants** (from dataset row):")
+                st.write(
+                    {
+                        "Datetime": str(row["Datetime"]),
+                        "PM2.5": float(row["PM2.5"]),
+                        "NO2": float(row["NO2"]),
+                        "CO": float(row["CO"]),
+                        "SO2": float(row["SO2"]),
+                        "O3": float(row["O3"]),
+                        "True AQI": float(row["AQI"]),
+                    }
+                )
+
+                # Build 1-row feature frame
+                X_row = pd.DataFrame([row])
+
+                if st.button("Run research model on this dataset row", key="run_dataset_demo"):
+                    y_pred, regime_label = hybrid_predict_from_features(X_row)
+                    if y_pred is None:
+                        st.error(regime_label)
+                    else:
+                        y_true = float(row["AQI"])
+                        err = abs(y_pred - y_true)
+                        st.markdown(f"**Hybrid regime decision:** {regime_label}")
+                        st.metric("Predicted AQI (Hybrid)", f"{y_pred:.1f}")
+                        st.metric("True AQI (Dataset)", f"{y_true:.1f}")
+                        st.metric("Absolute Error", f"{err:.1f}")
+        except Exception as e:
+            st.error(f"Could not load dataset-backed demo: {e}")
+
     # Pollutant inputs
     PM2_5 = st.number_input("PM2.5 (Usually ranges from 0.1 to 120)", min_value=0.0, max_value=950.0, step=0.01, format="%.2f")
     NO2 = st.number_input("NO2 (Usually ranges from 0.01 to 60)", min_value=0.0, max_value=362.0, step=0.01, format="%.2f")
@@ -724,10 +834,7 @@ def show_predict_page():
                 st.warning(regime_label)
                 # Fallback to baseline if hybrid is unavailable
                 if baseline_regressor is not None:
-                    X = pd.DataFrame(
-                        [[PM2_5, NO2, CO, SO2, O3]],
-                        columns=['PM2.5', 'NO2', 'CO', 'SO2', 'O3']
-                    )
+                    X = build_hybrid_feature_row(PM2_5, NO2, CO, SO2, O3)
                     aqi_pred = baseline_regressor.predict(X)[0]
                     regime_label = "Baseline Random Forest (fallback)"
                 else:
@@ -739,10 +846,8 @@ def show_predict_page():
             if baseline_regressor is None:
                 st.error("Baseline model is not available.")
                 return
-            X = pd.DataFrame(
-                [[PM2_5, NO2, CO, SO2, O3]],
-                columns=['PM2.5', 'NO2', 'CO', 'SO2', 'O3']
-            )
+            # Baseline regressor is trained on engineered features; use the same feature builder
+            X = build_hybrid_feature_row(PM2_5, NO2, CO, SO2, O3)
             AQI = baseline_regressor.predict(X)[0]
 
         category, emoji = get_aqi_category(AQI)
